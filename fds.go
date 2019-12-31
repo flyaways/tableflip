@@ -1,108 +1,87 @@
 package tableflip
 
 import (
+	"context"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/pkg/errors"
 )
 
-// Listener can be shared between processes.
-type Listener interface {
-	net.Listener
-	syscall.Conn
-}
-
-// Conn can be shared between processes.
-type Conn interface {
-	net.Conn
-	syscall.Conn
-}
-
 const (
-	listenKind = "listener"
-	connKind   = "conn"
-	fdKind     = "fd"
+	ListenTCPKind = "listenertcp"
+	ListenUDPKind = "listenerudp"
+	ConnecTCPKind = "connectitcp"
 )
 
-type fileName [3]string
-
-func (name fileName) String() string {
-	return strings.Join(name[:], ":")
-}
-
-func (name fileName) isUnixListener() bool {
-	return name[0] == listenKind && (name[1] == "unix" || name[1] == "unixpacket")
-}
-
-// file works around the fact that it's not possible
-// to get the fd from an os.File without putting it into
-// blocking mode.
-type file struct {
-	*os.File
-	fd uintptr
-}
-
-func newFile(fd uintptr, name fileName) *file {
-	f := os.NewFile(fd, name.String())
-	if f == nil {
-		return nil
-	}
-
-	return &file{
-		f,
-		fd,
-	}
-}
-
-// Fds holds all file descriptors inherited from the
-// parent process.
+// Fds holds all file descriptors inherited from the parent process.
 type Fds struct {
 	mu sync.Mutex
 	// NB: Files in these maps may be in blocking mode.
-	inherited map[fileName]*file
-	used      map[fileName]*file
-}
-
-func newFds(inherited map[fileName]*file) *Fds {
-	if inherited == nil {
-		inherited = make(map[fileName]*file)
-	}
-	return &Fds{
-		inherited: inherited,
-		used:      make(map[fileName]*file),
-	}
+	inherited map[string]*os.File
+	used      map[string]*os.File
+	Reuseport bool
 }
 
 // Listen returns a listener inherited from the parent process, or creates a new one.
-func (f *Fds) Listen(network, addr string) (net.Listener, error) {
+func (f *Fds) ListenTCP(network, addr string) (net.Listener, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	ln, err := f.listenerLocked(network, addr)
-	if err != nil {
-		return nil, err
+	var ln net.Listener
+	var err error
+	key := ListenTCPKind + ":" + network + ":" + addr
+	file := f.inherited[key]
+	if file != nil {
+		ln, err = net.FileListener(file)
+		if err != nil {
+			return nil, errors.Wrapf(err, "can't inherit listener %s %s", network, addr)
+		}
+
+		delete(f.inherited, key)
+		f.used[key] = file
+
+		if ln != nil {
+			return ln, nil
+		}
 	}
 
-	if ln != nil {
-		return ln, nil
-	}
+	var lfd uintptr
+	lc := net.ListenConfig{Control: func(network, address string, conn syscall.RawConn) (err error) {
+		fn := func(fd uintptr) {
+			lfd = fd
+			if f.Reuseport {
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				if err != nil {
+					return
+				}
 
-	ln, err = net.Listen(network, addr)
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+				if err != nil {
+					return
+				}
+
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.FD_CLOEXEC, 0)
+				if err != nil {
+					return
+				}
+			}
+		}
+
+		if err = conn.Control(fn); err != nil {
+			return
+		}
+		return
+	}}
+
+	ln, err = lc.Listen(context.Background(), network, addr)
 	if err != nil {
 		return nil, errors.Wrap(err, "can't create new listener")
 	}
 
-	if _, ok := ln.(Listener); !ok {
-		ln.Close()
-		return nil, errors.Errorf("%T doesn't implement tableflip.Listener", ln)
-	}
-
-	err = f.addListenerLocked(network, addr, ln.(Listener))
-	if err != nil {
+	if err := f.addConn(key, lfd); err != nil {
 		ln.Close()
 		return nil, err
 	}
@@ -110,189 +89,121 @@ func (f *Fds) Listen(network, addr string) (net.Listener, error) {
 	return ln, nil
 }
 
-// Listener returns an inherited listener or nil.
-//
-// It is safe to close the returned listener.
-func (f *Fds) Listener(network, addr string) (net.Listener, error) {
+// ListenUDP returns a listener inherited from the parent process, or creates a new one.
+func (f *Fds) ListenUDP(network, addr string) (net.PacketConn, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	return f.listenerLocked(network, addr)
-}
-
-func (f *Fds) listenerLocked(network, addr string) (net.Listener, error) {
-	key := fileName{listenKind, network, addr}
+	var ln net.PacketConn
+	var err error
+	key := ListenUDPKind + ":" + network + ":" + addr
 	file := f.inherited[key]
-	if file == nil {
-		return nil, nil
+	if file != nil {
+		ln, err = net.FilePacketConn(file)
+		if err != nil {
+			return nil, errors.Wrapf(err, "can't inherit listener %s %s", network, addr)
+		}
+
+		delete(f.inherited, key)
+		f.used[key] = file
+
+		if ln != nil {
+			return ln, nil
+		}
 	}
 
-	ln, err := net.FileListener(file.File)
+	var lfd uintptr
+	lc := net.ListenConfig{
+		Control: func(network, address string, conn syscall.RawConn) (err error) {
+			fn := func(fd uintptr) {
+				lfd = fd
+				if f.Reuseport {
+					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+					if err != nil {
+						return
+					}
+
+					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+					if err != nil {
+						return
+					}
+
+					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.FD_CLOEXEC, 0)
+					if err != nil {
+						return
+					}
+				}
+			}
+
+			if err = conn.Control(fn); err != nil {
+				return
+			}
+			return
+		}}
+
+	ln, err = lc.ListenPacket(context.Background(), network, addr)
 	if err != nil {
-		return nil, errors.Wrapf(err, "can't inherit listener %s %s", network, addr)
+		return nil, errors.Wrap(err, "ListenPacket")
 	}
 
-	delete(f.inherited, key)
-	f.used[key] = file
+	//add udp PacketConn locked
+	err = f.addConn(key, lfd)
+	if err != nil {
+		ln.Close()
+		return nil, errors.Wrap(err, "addConn")
+	}
+
 	return ln, nil
 }
 
-// AddListener adds a listener.
-//
-// It is safe to close ln after calling the method.
-// Any existing listener with the same address is overwitten.
-func (f *Fds) AddListener(network, addr string, ln Listener) error {
+type NewConn func(string, string) (net.Conn, uintptr, error)
+
+// Conn returns an inherited connection or nil.It is safe to close the returned Conn.
+func (f *Fds) ConnectTCP(network, addr, key string, newconn NewConn) (net.Conn, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	return f.addListenerLocked(network, addr, ln)
-}
+	key = ConnecTCPKind + ":" + network + ":" + addr + ":" + key
 
-type unlinkOnCloser interface {
-	SetUnlinkOnClose(bool)
-}
-
-func (f *Fds) addListenerLocked(network, addr string, ln Listener) error {
-	if ifc, ok := ln.(unlinkOnCloser); ok {
-		ifc.SetUnlinkOnClose(false)
+	if file, ok := f.inherited[key]; ok && file != nil {
+		if conn, err := net.FileConn(file); err == nil {
+			delete(f.inherited, key)
+			f.used[key] = file
+			return conn, nil
+		}
 	}
 
-	return f.addConnLocked(listenKind, network, addr, ln)
-}
-
-// Conn returns an inherited connection or nil.
-//
-// It is safe to close the returned Conn.
-func (f *Fds) Conn(network, addr string) (net.Conn, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	key := fileName{connKind, network, addr}
-	file := f.inherited[key]
-	if file == nil {
-		return nil, nil
-	}
-
-	conn, err := net.FileConn(file.File)
+	conn, fd, err := newconn(network, addr)
 	if err != nil {
-		return nil, errors.Wrapf(err, "can't inherit connection %s %s", network, addr)
+		return nil, errors.Wrapf(err, "can't newconn %s (%s %s)", ConnecTCPKind, network, addr)
 	}
 
-	delete(f.inherited, key)
-	f.used[key] = file
+	if err := f.addConn(key, fd); err != nil {
+		return nil, errors.Wrapf(err, "can't dup %s (%s %s)", ConnecTCPKind, network, addr)
+	}
+
 	return conn, nil
 }
 
-// AddConn adds a connection.
-//
-// It is safe to close conn after calling this method.
-func (f *Fds) AddConn(network, addr string, conn Conn) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return f.addConnLocked(connKind, network, addr, conn)
-}
-
-func (f *Fds) addConnLocked(kind, network, addr string, conn syscall.Conn) error {
-	key := fileName{kind, network, addr}
-	file, err := dupConn(conn, key)
+func (f *Fds) addConn(key string, fd uintptr) error {
+	file, err := f.dupFd(fd, key)
 	if err != nil {
-		return errors.Wrapf(err, "can't dup %s (%s %s)", kind, network, addr)
+		return errors.Wrapf(err, "can't dup %s", key)
 	}
 
 	delete(f.inherited, key)
 	f.used[key] = file
 	return nil
-}
-
-// File returns an inherited file or nil.
-//
-// The descriptor may be in blocking mode.
-func (f *Fds) File(name string) (*os.File, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	key := fileName{fdKind, name}
-	file := f.inherited[key]
-	if file == nil {
-		return nil, nil
-	}
-
-	// Make a copy of the file, since we don't want to
-	// allow the caller to invalidate fds in f.inherited.
-	dup, err := dupFd(file.fd, key)
-	if err != nil {
-		return nil, err
-	}
-
-	delete(f.inherited, key)
-	f.used[key] = file
-	return dup.File, nil
-}
-
-// AddFile adds a file.
-//
-// Until Go 1.12, file will be in blocking mode
-// after this call.
-func (f *Fds) AddFile(name string, file *os.File) error {
-	key := fileName{fdKind, name}
-
-	dup, err := dupFile(file, key)
-	if err != nil {
-		return err
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	delete(f.inherited, key)
-	f.used[key] = dup
-	return nil
-}
-
-func (f *Fds) copy() map[fileName]*file {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	files := make(map[fileName]*file, len(f.used))
-	for key, file := range f.used {
-		files[key] = file
-	}
-
-	return files
 }
 
 func (f *Fds) closeInherited() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	for key, file := range f.inherited {
-		if key.isUnixListener() {
-			// Remove inherited but unused Unix sockets from the file system.
-			// This undoes the effect of SetUnlinkOnClose(false).
-			_ = unlinkUnixSocket(key[2])
-		}
+	for _, file := range f.inherited {
 		_ = file.Close()
 	}
-	f.inherited = make(map[fileName]*file)
-}
-
-func unlinkUnixSocket(path string) error {
-	if strings.HasPrefix(path, "@") {
-		// Don't unlink sockets using the abstract namespace.
-		return nil
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-
-	if info.Mode()&os.ModeSocket == 0 {
-		return nil
-	}
-
-	return os.Remove(path)
+	f.inherited = make(map[string]*os.File)
 }
 
 func (f *Fds) closeUsed() {
@@ -302,49 +213,38 @@ func (f *Fds) closeUsed() {
 	for _, file := range f.used {
 		_ = file.Close()
 	}
-	f.used = make(map[fileName]*file)
+	f.used = make(map[string]*os.File)
 }
 
-func (f *Fds) closeAndRemoveUsed() {
+func (f *Fds) copy() map[string]*os.File {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	files := make(map[string]*os.File, len(f.used))
 	for key, file := range f.used {
-		if key.isUnixListener() {
-			// Remove used Unix Domain Sockets if we are shutting
-			// down without having done an upgrade.
-			// This undoes the effect of SetUnlinkOnClose(false).
-			_ = unlinkUnixSocket(key[2])
+		files[key] = file
+	}
+
+	return files
+}
+
+func (f *Fds) dupFd(fd uintptr, name string) (*os.File, error) {
+	dupfd, _, err := syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_DUPFD_CLOEXEC, 0)
+	if err != 0 {
+		return nil, errors.Wrap(err, "can't dup fd using F_DUPFD_CLOEXEC")
+	}
+
+	if f.Reuseport {
+		err := syscall.SetsockoptInt(int(dupfd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		if err != nil {
+			return nil, errors.Wrap(err, "can't set SO_REUSEADDR")
 		}
-		_ = file.Close()
-	}
-	f.used = make(map[fileName]*file)
-}
 
-func dupConn(conn syscall.Conn, name fileName) (*file, error) {
-	// Use SyscallConn instead of File to avoid making the original
-	// fd non-blocking.
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return nil, err
+		err = syscall.SetsockoptInt(int(dupfd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+		if err != nil {
+			return nil, errors.Wrap(err, "can't set SO_REUSEPORT")
+		}
 	}
 
-	var dup *file
-	var duperr error
-	err = raw.Control(func(fd uintptr) {
-		dup, duperr = dupFd(fd, name)
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "can't access fd")
-	}
-	return dup, duperr
-}
-
-func dupFd(fd uintptr, name fileName) (*file, error) {
-	dupfd, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_DUPFD_CLOEXEC, 0)
-	if errno != 0 {
-		return nil, errors.Wrap(errno, "can't dup fd using fcntl")
-	}
-
-	return newFile(dupfd, name), nil
+	return os.NewFile(dupfd, name), nil
 }

@@ -1,4 +1,4 @@
-package tableflip_test
+package main
 
 import (
 	"flag"
@@ -9,17 +9,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cloudflare/tableflip"
+	"github.com/flyaways/tableflip"
+)
+
+var (
+	listenAddr = flag.String("listen", "localhost:8080", "`Address` to listen on")
+	pidFile    = flag.String("pid-file", "", "`Path` to pid file")
 )
 
 // This shows how to use the Upgrader
 // with a listener based service.
-func Example_tcpServer() {
-	var (
-		listenAddr = flag.String("listen", "localhost:8080", "`Address` to listen on")
-		pidFile    = flag.String("pid-file", "", "`Path` to pid file")
-	)
-
+func main() {
 	flag.Parse()
 	log.SetPrefix(fmt.Sprintf("%d ", os.Getpid()))
 
@@ -29,7 +29,6 @@ func Example_tcpServer() {
 	if err != nil {
 		panic(err)
 	}
-	defer upg.Stop()
 
 	// Do an upgrade on SIGHUP
 	go func() {
@@ -43,7 +42,7 @@ func Example_tcpServer() {
 		}
 	}()
 
-	ln, err := upg.Fds.Listen("tcp", *listenAddr)
+	ln, err := upg.ListenTCP("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalln("Can't listen:", err)
 	}
@@ -71,5 +70,6 @@ func Example_tcpServer() {
 	if err := upg.Ready(); err != nil {
 		panic(err)
 	}
+
 	<-upg.Exit()
 }
