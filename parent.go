@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"syscall"
 
 	"github.com/pkg/errors"
 )
@@ -15,65 +16,48 @@ const (
 )
 
 type parent struct {
-	wr     *os.File
-	result <-chan error
-	exited <-chan struct{}
+	readyPipeWrite *os.File
+	exited         <-chan struct{}
 }
 
-func newParent(env *env) (*parent, map[fileName]*file, error) {
-	if env.getenv(sentinelEnvVar) == "" {
-		return nil, make(map[fileName]*file), nil
+func FindParent() (*parent, map[string]*os.File, error) {
+	if os.Getenv(sentinelEnvVar) == "" {
+		return nil, make(map[string]*os.File), nil
 	}
 
-	wr := env.newFile(3, "write")
-	rd := env.newFile(4, "read")
+	readyPipeWrite := os.NewFile(3, "write")
+	fdNamesRead := os.NewFile(4, "read")
 
-	var names [][]string
-	dec := gob.NewDecoder(rd)
+	var names []string
+	dec := gob.NewDecoder(fdNamesRead)
 	if err := dec.Decode(&names); err != nil {
 		return nil, nil, errors.Wrap(err, "can't decode names from parent process")
 	}
 
-	files := make(map[fileName]*file)
-	for i, parts := range names {
-		var key fileName
-		copy(key[:], parts)
-
-		// Start at 5 to account for stdin, etc. and write
-		// and read pipes.
+	files := make(map[string]*os.File)
+	for i, key := range names {
+		// Start at 5 to account for stdin, etc. and writev and read pipes.
 		fd := 5 + i
-		env.closeOnExec(fd)
-		files[key] = &file{
-			env.newFile(uintptr(fd), key.String()),
-			uintptr(fd),
-		}
+		syscall.CloseOnExec(fd)
+		files[key] = os.NewFile(uintptr(fd), key)
 	}
 
-	result := make(chan error, 1)
 	exited := make(chan struct{})
 	go func() {
-		defer rd.Close()
-
-		n, err := io.Copy(ioutil.Discard, rd)
-		if n != 0 {
-			err = errors.New("unexpected data from parent process")
-		} else if err != nil {
-			err = errors.Wrap(err, "unexpected error while waiting for parent to exit")
-		}
-		result <- err
+		defer fdNamesRead.Close()
+		_, _ = io.Copy(ioutil.Discard, fdNamesRead)
 		close(exited)
 	}()
 
 	return &parent{
-		wr:     wr,
-		result: result,
-		exited: exited,
+		readyPipeWrite: readyPipeWrite,
+		exited:         exited,
 	}, files, nil
 }
 
 func (ps *parent) sendReady() error {
-	defer ps.wr.Close()
-	if _, err := ps.wr.Write([]byte{notifyReady}); err != nil {
+	defer ps.readyPipeWrite.Close()
+	if _, err := ps.readyPipeWrite.Write([]byte{notifyReady}); err != nil {
 		return errors.Wrap(err, "can't notify parent process")
 	}
 	return nil
