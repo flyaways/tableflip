@@ -27,6 +27,8 @@ type Options struct {
 	PIDFile string
 	// ListenConfig is a custom ListenConfig. Defaults to an empty ListenConfig
 	ListenConfig *net.ListenConfig
+	// CycleUpgrade is allow to cycle upgrade. Defaults to false
+	CycleUpgrade bool
 }
 
 // Upgrader handles zero downtime upgrades and passing files between processes.
@@ -224,7 +226,7 @@ func (u *Upgrader) run() {
 				continue
 			}
 
-			if parentExited != nil {
+			if !u.opts.CycleUpgrade && parentExited != nil {
 				request <- errors.New("parent hasn't exited")
 				continue
 			}
