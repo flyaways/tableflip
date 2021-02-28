@@ -300,6 +300,10 @@ func writePIDFile(path string) error {
 		return errors.New("empty initial working directory")
 	}
 
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		return fmt.Errorf("can't make directories for new logfile: %s", err)
+	}
+
 	fh, err := ioutil.TempFile(dir, file)
 	if err != nil {
 		return err
